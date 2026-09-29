@@ -1,0 +1,7 @@
+# Never commit your real key
+.streamlit/secrets.toml
+__pycache__/
+.venv/
+venv/
+.env
+.ipynb_checkpoints/

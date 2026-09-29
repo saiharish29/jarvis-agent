@@ -1,0 +1,6 @@
+streamlit>=1.40
+langchain>=1.4
+langchain-openrouter>=0.2.9
+langgraph>=1.2
+requests
+yfinance>=0.2.54
