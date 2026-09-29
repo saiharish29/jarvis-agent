@@ -4,3 +4,4 @@ langchain-openrouter>=0.2.9
 langgraph>=1.2
 requests
 yfinance>=0.2.54
+langsmith>=0.3

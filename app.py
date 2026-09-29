@@ -65,11 +65,28 @@ RETRY_ROUNDS = int(_setting("RETRY_ROUNDS", "2"))
 # Lower = much faster. Empty = the model's own default.
 REASONING_EFFORT = (_setting("REASONING_EFFORT", "low") or "").strip().lower()
 
-# Optional LangSmith tracing: add LANGSMITH_API_KEY to secrets to switch it on
-if _setting("LANGSMITH_API_KEY"):
+# Where is the app running? Streamlit Community Cloud runs apps from /mount/src.
+APP_ENV = _setting("APP_ENV") or ("cloud" if os.getcwd().startswith("/mount/src") else "local")
+
+# ---------------------------------------------------------------- LangSmith --
+# Optional observability: add LANGSMITH_API_KEY to secrets to switch it on.
+# Every question then becomes one trace in LangSmith (model calls, tool calls,
+# fallbacks, tokens, timings), grouped into one "thread" per conversation.
+LANGSMITH_ON = bool(_setting("LANGSMITH_API_KEY"))
+LANGSMITH_PROJECT = _setting("LANGSMITH_PROJECT", "jarvis-agent")
+# Only needed if your LangSmith account is NOT in the US region, e.g.
+# EU: https://eu.api.smith.langchain.com   APAC: https://apac.api.smith.langchain.com
+LANGSMITH_ENDPOINT = _setting("LANGSMITH_ENDPOINT", "")
+if LANGSMITH_ON:
     os.environ["LANGSMITH_API_KEY"] = _setting("LANGSMITH_API_KEY")
     os.environ["LANGSMITH_TRACING"] = "true"
-    os.environ["LANGSMITH_PROJECT"] = _setting("LANGSMITH_PROJECT", "jarvis-agent")
+    os.environ["LANGSMITH_PROJECT"] = LANGSMITH_PROJECT
+    if LANGSMITH_ENDPOINT:
+        os.environ["LANGSMITH_ENDPOINT"] = LANGSMITH_ENDPOINT
+# Web address of the LangSmith UI (for the sidebar link)
+LANGSMITH_UI = ("https://eu.smith.langchain.com" if "eu." in LANGSMITH_ENDPOINT else
+                "https://apac.smith.langchain.com" if "apac." in LANGSMITH_ENDPOINT else
+                "https://smith.langchain.com")
 
 SYSTEM_PROMPT = (
     "You are an AI assistant, your name is Jarvis developed by Harish.\n"
@@ -190,6 +207,43 @@ def build_agent(models: tuple, api_key: str, timeout_s: int, effort: str, rounds
 agent = build_agent(tuple(MODELS), API_KEY, LLM_TIMEOUT, REASONING_EFFORT, RETRY_ROUNDS)
 
 
+@st.cache_resource
+def langsmith_client():
+    """One shared LangSmith client (None when LangSmith is off)."""
+    if not LANGSMITH_ON:
+        return None
+    from langsmith import Client
+    return Client()
+
+
+def send_feedback(run_id: str, key: str, score=None, value=None, comment=None):
+    """Attach a label/score to a trace in LangSmith, in the background.
+
+    Used for: the user's thumbs up/down ("user_score"), and automatic labels
+    ("answered_by" = which model answered, "fallbacks" = how many model attempts
+    failed before that, e.g. a busy model skipped) so you can filter traces by them."""
+    client = langsmith_client()
+    if client is None or not run_id:
+        return
+
+    def _send():
+        try:
+            client.create_feedback(run_id, key=key, score=score, value=value, comment=comment)
+            log.info("LANGSMITH feedback %s=%s on run %s", key, value if value is not None else score, run_id[:8])
+        except Exception as exc:  # never break the chat because of observability
+            log.warning("LANGSMITH feedback %s failed: %s", key, exc)
+
+    threading.Thread(target=_send, daemon=True).start()
+
+
+def on_thumbs(run_id: str, widget_key: str):
+    """Called by st.feedback when the user clicks 👍 or 👎."""
+    choice = st.session_state.get(widget_key)  # 1 = 👍, 0 = 👎, None = cleared
+    if choice is not None:
+        send_feedback(run_id, "user_score", score=int(choice),
+                      comment="thumbs up" if choice == 1 else "thumbs down")
+
+
 # ------------------------------------------------------------ health check --
 def health_check():
     """Test each moving part separately so you know which one is broken."""
@@ -244,6 +298,14 @@ def health_check():
     check("LLM model call", model_reply)
     check("Weather tool (Open-Meteo)", weather)
     check("Stock tool (Yahoo)", stock)
+
+    if LANGSMITH_ON:
+        def langsmith_check():
+            client = langsmith_client()
+            next(iter(client.list_projects(limit=1)), None)  # fails if key/region is wrong
+            return True, (f"key is valid; traces go to project '{LANGSMITH_PROJECT}'"
+                          + (f" at {LANGSMITH_ENDPOINT}" if LANGSMITH_ENDPOINT else ""))
+        check("LangSmith tracing", langsmith_check)
     return results
 
 
@@ -286,7 +348,12 @@ with st.sidebar:
     if st.session_state.get("free_models") is not None:
         st.caption("Copy one or more into MODEL in secrets (comma-separated):")
         st.code("\n".join(st.session_state.free_models) or "(none right now)", language=None)
-    st.caption(f"{len(MODELS)} models · retry rounds: {RETRY_ROUNDS} · timeout: {LLM_TIMEOUT}s · reasoning: {REASONING_EFFORT or 'default'} · LangSmith tracing: " + ("ON" if os.environ.get("LANGSMITH_TRACING") else "off"))
+    st.caption(f"{len(MODELS)} models · retry rounds: {RETRY_ROUNDS} · timeout: {LLM_TIMEOUT}s · "
+               f"reasoning: {REASONING_EFFORT or 'default'} · running: {APP_ENV} · "
+               f"LangSmith tracing: {'ON' if LANGSMITH_ON else 'off'}")
+    if LANGSMITH_ON:
+        st.markdown(f"🔍 [Open LangSmith]({LANGSMITH_UI}) → project **{LANGSMITH_PROJECT}** "
+                    f"(this chat = thread `{st.session_state.thread_id[:8]}`)")
 
 
 def show_tools(tools_used):
@@ -297,10 +364,22 @@ def show_tools(tools_used):
                 st.code(result, language=None)
 
 
-for role, text, tools_used in st.session_state.chat:
+def show_thumbs(meta):
+    """👍/👎 under an answer; the click is sent to LangSmith as feedback."""
+    run_id = (meta or {}).get("run_id")
+    if LANGSMITH_ON and run_id:
+        wkey = f"thumbs_{run_id}"
+        st.feedback("thumbs", key=wkey, on_change=on_thumbs, args=(run_id, wkey))
+
+
+for entry in st.session_state.chat:
+    role, text, tools_used = entry[:3]
+    meta = entry[3] if len(entry) > 3 else {}
     with st.chat_message(role):
         st.markdown(text)
         show_tools(tools_used)
+        if role == "assistant":
+            show_thumbs(meta)
 
 # ------------------------------------------------------------------ chat ----
 if question := st.chat_input("Ask Jarvis anything..."):
@@ -309,7 +388,25 @@ if question := st.chat_input("Ask Jarvis anything..."):
         st.markdown(question)
 
     with st.chat_message("assistant"):
-        config = {"configurable": {"thread_id": st.session_state.thread_id}}
+        # run_id / tags / metadata are what LangSmith shows and filters on.
+        # "thread_id" + "session_id" metadata group one conversation into a LangSmith thread.
+        run_id = str(uuid.uuid4())
+        config = {
+            "configurable": {"thread_id": st.session_state.thread_id},
+            "run_id": run_id,
+            "run_name": "Jarvis chat",
+            "tags": ["jarvis", f"env:{APP_ENV}"],
+            "metadata": {
+                "thread_id": st.session_state.thread_id,
+                "session_id": st.session_state.thread_id,
+                "app_env": APP_ENV,
+                "model_chain": MODELS,
+                "primary_model": MODEL,
+                "reasoning_effort": REASONING_EFFORT or "default",
+                "llm_timeout_s": LLM_TIMEOUT,
+                "retry_rounds": RETRY_ROUNDS,
+            },
+        }
         tools_used, pending, answer, answered_by = [], {}, None, None
         t_start = step_start = time.time()
         log.info("QUESTION %r (thread %s)", question, st.session_state.thread_id[:8])
@@ -399,4 +496,11 @@ if question := st.chat_input("Ask Jarvis anything..."):
         st.markdown(answer or "(the model returned an empty answer)")
         show_tools(tools_used)
 
-    st.session_state.chat.append(("assistant", answer or "", tools_used))
+        # Automatic labels in LangSmith: which model answered, how many attempts failed first
+        failed_attempts = sum(1 for _, ok, _, _ in attempts if not ok)
+        send_feedback(run_id, "fallbacks", score=failed_attempts)
+        send_feedback(run_id, "answered_by", value=answered_by or "none (failed)")
+        meta = {"run_id": run_id}
+        show_thumbs(meta)
+
+    st.session_state.chat.append(("assistant", answer or "", tools_used, meta))

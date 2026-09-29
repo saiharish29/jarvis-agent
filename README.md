@@ -102,11 +102,35 @@ To change the key or model: app menu **⋮ → Settings → Secrets**.
 3. **Logs** – one line per step, with timings:
    - local: the terminal where you ran `streamlit`
    - cloud: **Manage app** (bottom-right of the app) → logs
-4. **LangSmith (optional)** – sign up free at https://smith.langchain.com, create
-   an API key, add `LANGSMITH_API_KEY` to secrets. Every question then appears as
-   a full trace (prompts, tool inputs/outputs, tokens, latency).
+4. **LangSmith (optional)** – full traces of every question. See the next section.
 
 Each model call times out after `LLM_TIMEOUT` seconds (default 180; change it in secrets), so the app never sits on “Thinking…” forever.
+
+## LangSmith observability (optional)
+
+1. Sign up free at https://smith.langchain.com → **Settings → API Keys → Create API Key**.
+2. Add to `.streamlit/secrets.toml` (and to the Streamlit Cloud **Secrets** box):
+   ```toml
+   LANGSMITH_API_KEY = "lsv2_pt_..."
+   LANGSMITH_PROJECT = "jarvis-agent"
+   # LANGSMITH_ENDPOINT = "https://eu.api.smith.langchain.com"   # only for EU/APAC accounts
+   ```
+3. Restart the app. The sidebar shows **LangSmith tracing: ON** and a link; the health
+   check gets a **LangSmith tracing** line. No need to create the project – it is
+   created on the first question.
+
+What you get in LangSmith (project `jarvis-agent`):
+
+| Feature | Where to look |
+|---|---|
+| One **trace** per question ("Jarvis chat"): every model call, tool call, failed fallback attempt, tokens and timings | **Runs** tab |
+| One **thread** per browser-tab conversation (metadata `thread_id` / `session_id`) | **Threads** tab |
+| **Tags** `jarvis`, `env:local` / `env:cloud` and metadata (model chain, reasoning effort, timeout, retry rounds) | filter bar |
+| Automatic labels: `answered_by` (model that answered), `fallbacks` (failed attempts first) | **Feedback** column / filters |
+| 👍 / 👎 under each answer → `user_score` 1 / 0 | **Feedback** column – filter `user_score = 0` to find bad answers |
+
+Free Developer plan: 5,000 traces/month, 14-day retention. Traces are sent in the
+background and never slow down or break the chat.
 
 ## Testing models before using them
 
@@ -150,6 +174,8 @@ support tools* and `test_models.py`.
 | Stuck/slow, then “didn't reply within …s” | The free model is overloaded; try again, raise `LLM_TIMEOUT`, or change `MODEL` |
 | `ResponseValidationError … error_type: 'timeout'` | OpenRouter itself timed out waiting for the model. Add fallbacks: `MODEL = "model-a:free, model-b:free"` (sidebar → *List free models that support tools*) |
 | Build fails | Open **Manage app** (bottom-right) and read the logs |
+| LangSmith line red in health check / no traces | Check `LANGSMITH_API_KEY`; if your LangSmith account is EU/APAC set `LANGSMITH_ENDPOINT`; restart the app |
+| No 👍/👎 buttons | They only appear when LangSmith is on (ratings are stored there) |
 | App shows “This app has gone to sleep” | Free apps sleep when unused; click the button to wake it (about 30 s) |
 
 Notes: chat memory lives in the server's RAM, so it resets when the app restarts
